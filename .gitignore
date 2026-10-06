@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local run artifacts & non-published content
+outputs/
+paper_thesis/
+scripts_backup/
+
+# Env & OS
+.env
+.DS_Store

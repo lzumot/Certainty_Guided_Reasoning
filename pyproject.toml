@@ -1,0 +1,21 @@
+[project]
+name = "certainty-guided-reasoning"
+version = "0.1.0"
+description = "Certainty-Guided Reasoning (CGR): model-agnostic adaptive inference with certainty-based early exit."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31",
+    "datasets>=2.18",
+    "huggingface-hub>=0.23",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "modal>=0.64",
+    "tokenizers>=0.19",
+]
+
+# sglang[all] and fastapi[standard] are installed inside the Modal serving
+# images (certainty_guided_reasoning/modal_serve.py), not in the local env.
+
+[tool.uv]
+package = false
