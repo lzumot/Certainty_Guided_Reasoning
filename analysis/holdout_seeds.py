@@ -8,7 +8,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from analysis.replay import MAX_SEED, THETAS, load_probes, make_counter, simulate
+from analysis.replay import (MAX_SEED, THETAS, load_probes, make_counter,
+                             probe_prefix_for, simulate)
 
 SPLIT = 32  # seeds 0..SPLIT on one side, SPLIT+1..MAX_SEED on the other
 
@@ -25,11 +26,12 @@ def main() -> None:
     tok = None
     if "--tokenizer" in sys.argv:
         tok = sys.argv[sys.argv.index("--tokenizer") + 1]
-    count, prefix, label = make_counter(tok)
-
     root = Path("outputs") / run
     recs = [r for r in load_probes(root / "probes")
             if r.get("seed", -1) <= MAX_SEED]
+    # Probe cost depends on the model family's answer prefix.
+    count, prefix, label = make_counter(
+        tok, probe_prefix_for(recs[0].get("model", "") if recs else ""))
     low = [r for r in recs if r["seed"] <= SPLIT]
     high = [r for r in recs if r["seed"] > SPLIT]
 

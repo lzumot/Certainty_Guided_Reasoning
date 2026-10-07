@@ -46,15 +46,52 @@ DATASETS = {
     for key, cfg in TASKS.items()
 }
 
+
+def load_task_dataset(task: str, limit: int | None = None):
+    """Load (problems, gold answers) using the task's split/column names.
+
+    GSM8K needs config "main", split "test", column "question"; AIME uses the
+    TaskConfig defaults.
+    """
+    from datasets import load_dataset  # local import: only needed at run time
+    cfg = TASKS[task]
+    ds = (load_dataset(cfg.dataset_id, cfg.dataset_config)
+          if cfg.dataset_config else load_dataset(cfg.dataset_id))[cfg.split]
+    problems = list(ds[cfg.problem_field])
+    answers = list(ds[cfg.answer_field])
+    if limit is not None:
+        problems, answers = problems[:limit], answers[:limit]
+    return problems, [process_answer_for(task, a) for a in answers]
+
 PROMPT_SUFFIX = (
     " Please reason step by step, and put your final answer within \\boxed{}."
 )
 
 INVALID_CERTAINTY = -1.0
 
-# Bare assistant turn, no system block (prefilled '<think>' is ignored).
-# An earlier draft had 'nn' instead of '\\n\\n'; never reached baseline.
-def create_prompt(question: str) -> str:
+# Chat templates per model family. qwen3.5 is byte-identical to the original
+# hardcoded prompt (existing AIME runs unaffected) and must NOT prefill
+# '<think>\n' — it ignores the tag and loops. R1-Distill and QwQ prefill it,
+def prompt_family(model: str) -> str:
+    """Template family for a model id; raises on an unrecognised id."""
+    m = (model or "").lower()
+    if "deepseek-r1" in m:
+        return "deepseek-r1"
+    if "qwq" in m:
+        return "qwq"
+    if "qwen3.5" in m:
+        return "qwen3.5"
+    raise ValueError(f"no prompt template for model {model!r}")
+
+
+def create_prompt(question: str, model: str) -> str:
+    """Chat-template-faithful prompt. No BOS added (the server prepends it)."""
+    family = prompt_family(model)
+    if family == "deepseek-r1":
+        return f"<｜User｜>{question}{PROMPT_SUFFIX}<｜Assistant｜><think>\n"
+    if family == "qwq":
+        return (f"<|im_start|>user\n{question}{PROMPT_SUFFIX}<|im_end|>\n"
+                f"<|im_start|>assistant\n<think>\n")
     return (
         f"<|im_start|>user\n{question}{PROMPT_SUFFIX}<|im_end|>\n"
         f"<|im_start|>assistant\n"
@@ -113,7 +150,9 @@ def generate_trace(
                 f"{endpoint.rstrip('/')}/generate",
                 json=payload,
                 headers=headers,
-                timeout=3600,  # full 32k-token generation
+                # (connect, read): a dead socket must fail in minutes, not
+                # block the shard for an hour.
+                timeout=(15, max(300.0, max_tokens / 20.0)),
             )
             r.raise_for_status()
             data = r.json()
@@ -176,13 +215,33 @@ def _boxed_window_from(tokens: list[str], start: int) -> tuple[int, int] | None:
     return None
 
 
-def _boxed_bounds(tokens: list[str]) -> tuple[int, int] | None:
-    """Brace-depth-aware (open, close) of the FIRST complete \\boxed{...}."""
+def think_end_index(tokens: list[str]) -> int:
+    """Tokens before the closing '</think>' (len(tokens) if it never appears)."""
+    joined = "".join(tokens)
+    pos = joined.find("</think>")
+    if pos < 0:
+        return len(tokens)
+    upto = 0
     for i, t in enumerate(tokens):
-        if "boxed" in t:
-            b = _boxed_window_from(tokens, i)
-            if b is not None:
-                return b
+        upto += len(t)
+        if upto > pos:
+            return i
+    return len(tokens)
+
+
+def _answer_bounds(tokens: list[str]) -> tuple[int, int] | None:
+    """(open, close) of the LAST complete \\boxed{...} at/after '</think>'.
+
+    R1-Distill and QwQ also box guesses while thinking; the first boxed is
+    near-certain and would pin certainty at ~1.0.
+    """
+    think_end = think_end_index(tokens)
+    starts = [i for i, t in enumerate(tokens) if "boxed" in t]
+    candidates = [s for s in starts if s >= think_end] or starts
+    for s in reversed(candidates):  # the last boxed window wins
+        b = _boxed_window_from(tokens, s)
+        if b is not None:
+            return b
     return None
 
 
@@ -192,7 +251,7 @@ def select_answer_window(
     """Return (window_tokens, window_logprobs); raises ValueError on failure."""
     if not tokens or not logprobs or len(tokens) != len(logprobs):
         raise ValueError("empty or misaligned tokens/logprobs")
-    bounds = _boxed_bounds(tokens)
+    bounds = _answer_bounds(tokens)
     if bounds is None:
         raise ValueError("no complete 'boxed{' window in trace tokens")
     start, end = bounds
@@ -225,7 +284,7 @@ def get_certainty_greedy(trace: dict) -> float:
     top = trace.get("top_logprobs") or []
     if len(top) != len(trace["tokens"]):
         raise ValueError("top_logprobs missing or misaligned with tokens")
-    bounds = _boxed_bounds(trace["tokens"])
+    bounds = _answer_bounds(trace["tokens"])
     if bounds is None:
         raise ValueError("no complete 'boxed{' window in trace tokens")
     start, end = bounds
@@ -312,7 +371,7 @@ def capture_one(args, out_dir: Path, seed: int, i: int, problem: str,
     key = cache_key(args.model, seed, pid)
     if is_done(out_dir, key):
         return f"[skip] {key}"
-    prompt = create_prompt(problem)
+    prompt = create_prompt(problem, args.model)
     try:
         trace = generate_trace(
             args.endpoint, args.model, prompt, seed,
@@ -382,12 +441,7 @@ def main() -> None:
     p.add_argument("--out", default=str(TRACES_DIR))
     args = p.parse_args()
 
-    from datasets import load_dataset  # local import: only needed at run time
-
-    dataset_name, process_answer = DATASETS[args.task]
-    ds = load_dataset(dataset_name)["train"]
-    problems = ds["problem"][: args.problems] if args.problems else ds["problem"]
-    answers = [process_answer(a) for a in ds["answer"][: len(problems)]]
+    problems, answers = load_task_dataset(args.task, args.problems)
 
     seeds = parse_seeds(args.seeds)
     out_dir = Path(args.out)

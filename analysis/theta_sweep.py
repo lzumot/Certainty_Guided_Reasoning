@@ -29,6 +29,8 @@ def main() -> None:
                     help="tokenizer.json (or a directory holding one) for exact "
                          "probe cost; without it the character count is used, "
                          "which is an upper bound on tokens")
+    ap.add_argument("--metric", choices=("min", "mean"), default="min",
+                    help="certainty variant: min (Eq. 3) or mean token-prob")
     ap.add_argument("--prefix-tokens", type=int, default=None,
                     help="override the measured answer-prefix token count")
     ap.add_argument("--dpi", type=int, default=150,
@@ -38,6 +40,7 @@ def main() -> None:
                          "for submission")
     add_seed_args(ap)
     args = ap.parse_args()
+    cert_key = "certainty" if args.metric == "min" else "certainty_mean"
     probe_root = Path(args.probe_dir)
     run_name = probe_root.parent.name
     # Sampled probes (probes_sampled/) get their own figs dir so greedy and
@@ -65,7 +68,7 @@ def main() -> None:
           f"{'neverconf':>10}")
     print("-" * 76)
     for t in thetas:
-        r = simulate(recs, t, count_tokens, prefix_tokens)
+        r = simulate(recs, t, count_tokens, prefix_tokens, cert_key)
         results.append((t, r))
         print(f"{t:>6.2f} {r['acc_base']:>9.4f} {r['acc_cgr']:>8.4f} "
               f"{r['acc_cgr']-r['acc_base']:>+7.4f} "
@@ -94,7 +97,7 @@ def main() -> None:
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="center left",
                fontsize=9)
-    ax1.set_title(f"CGR θ sweep — {run_name} "
+    ax1.set_title(f"CGR θ sweep — {run_name} [{args.metric}] "
                   f"(n={results[0][1]['n']} traces)")
     fig.tight_layout()
     out.mkdir(parents=True, exist_ok=True)
@@ -121,8 +124,8 @@ def main() -> None:
             if not answered:
                 continue
             hit = next((p for p in rec["probes"]
-                        if p.get("certainty") is not None
-                        and p["certainty"] >= t), None)
+                        if p.get(cert_key) is not None
+                        and p[cert_key] >= t), None)
             if hit:
                 if is_correct(rec, hit["answer"]):
                     nc += 1

@@ -25,14 +25,19 @@ def _resolve(model: str, task: str, tag: str = "") -> tuple[str, str]:
 REMOTE_DIR, LOCAL_DIR = _resolve(MODEL_ID, TASK)
 
 
-def _modal() -> str:
-    """Locate the modal CLI (venv binary or PATH)."""
-    return shutil.which("modal") or ".venv/bin/modal"
+def _modal() -> list[str]:
+    """Modal CLI as a command list.
+
+    Falls back to `<this python> -m modal`: a venv's script carries a shebang
+    with the path it was created under, which breaks if the repo is moved.
+    """
+    exe = shutil.which("modal")
+    return [exe] if exe else [sys.executable, "-m", "modal"]
 
 
 def list_remote() -> list[str]:
     out = subprocess.run(
-        [_modal(), "volume", "ls", VOLUME, REMOTE_DIR],
+        [*_modal(), "volume", "ls", VOLUME, REMOTE_DIR],
         capture_output=True, text=True, check=True,
     ).stdout
     return [
@@ -44,7 +49,7 @@ def list_remote() -> list[str]:
 
 def fetch(name: str) -> bool:
     r = subprocess.run(
-        [_modal(), "volume", "get", VOLUME,
+        [*_modal(), "volume", "get", VOLUME,
          f"{REMOTE_DIR}/{name}", LOCAL_DIR + "/"],
         capture_output=True, text=True,
     )

@@ -47,6 +47,10 @@ app = modal.App("cgr-grid-runner")
     # (24h covers 1950 jobs with retry margin).
     timeout=24 * 60 * MINUTES,
     scaledown_window=1 * MINUTES,
+    # 2048 capture threads each hold a logprob-heavy response (~10MB); the
+    # default allocation OOMs at that concurrency.
+    cpu=8,
+    memory=32768,
 )
 def run_grid(
     endpoint: str,
@@ -58,6 +62,8 @@ def run_grid(
     tag: str = "",
     max_tokens: int = 32768,
     temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
     presence_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
     min_p: float = 0.0,
@@ -77,22 +83,16 @@ def run_grid(
         get_certainty,
         get_certainty_greedy,
         is_done,
+        load_task_dataset,
         parse_seeds,
         write_record,
-        DATASETS,
     )
     from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: E402
-    from datasets import load_dataset  # noqa: E402
 
     out_dir = Path(OUT_MOUNT) / f"{model.replace('/', '--')}_{task}{'_' + tag if tag else ''}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_name, process_answer = DATASETS[task]
-    ds = load_dataset(dataset_name)["train"]
-    problems = (
-        ds["problem"][:max_problems] if max_problems else ds["problem"]
-    )
-    answers = [process_answer(a) for a in ds["answer"][: len(problems)]]
+    problems, answers = load_task_dataset(task, max_problems)
     seeds = parse_seeds(seeds_spec)
 
     jobs = [(s, i) for s in seeds for i in range(len(problems))]
@@ -105,11 +105,12 @@ def run_grid(
         key = cache_key(model, seed, pid)
         if is_done(out_dir, key):
             return f"[skip] {key}"
-        prompt = create_prompt(problems[i])
+        prompt = create_prompt(problems[i], model)
         try:
             trace = generate_trace(
                 endpoint, model, prompt, seed,
                 max_tokens=max_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k,
                 presence_penalty=presence_penalty,
                 repetition_penalty=repetition_penalty, min_p=min_p,
             )
@@ -161,6 +162,8 @@ def main(
     tag: str = "",
     max_tokens: int = 32768,
     temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
     presence_penalty: float = 0.0,
     repetition_penalty: float = 1.0,
     min_p: float = 0.0,
@@ -172,6 +175,7 @@ def main(
         endpoint=endpoint, model=model, task=task,
         seeds_spec=seeds, max_problems=problems, workers=workers,
         tag=tag, max_tokens=max_tokens, temperature=temperature,
+        top_p=top_p, top_k=top_k,
         presence_penalty=presence_penalty,
         repetition_penalty=repetition_penalty, min_p=min_p,
     )
@@ -192,6 +196,8 @@ def launch(spec: dict):
         tag=spec.get("tag", ""),
         max_tokens=spec.get("max_tokens", 32768),
         temperature=spec.get("temperature", 0.6),
+        top_p=spec.get("top_p", 0.95),
+        top_k=spec.get("top_k", 20),
         presence_penalty=spec.get("presence_penalty", 0.0),
         repetition_penalty=spec.get("repetition_penalty", 1.0),
         min_p=spec.get("min_p", 0.0),

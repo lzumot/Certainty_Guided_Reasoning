@@ -30,6 +30,8 @@ def main() -> None:
     ap.add_argument("--out", default=None,
                     help="figs dir (default: <probe_dir>/../figs)")
     ap.add_argument("--theta", type=float, default=0.99)
+    ap.add_argument("--metric", choices=("min", "mean"), default="min",
+                    help="certainty variant: min (Eq. 3) or mean token-prob")
     ap.add_argument("--dpi", type=int, default=150,
                     help="raster resolution; ignored for pdf and svg")
     ap.add_argument("--fmt", default="png", choices=("png", "pdf", "svg"),
@@ -38,6 +40,7 @@ def main() -> None:
     add_seed_args(ap)
     args = ap.parse_args()
 
+    cert_key = "certainty" if args.metric == "min" else "certainty_mean"
     root = Path(args.probe_dir)
     # Sampled probes (probes_sampled/) get their own figs dir so greedy and
     # sampled analyses never overwrite each other's figures.
@@ -56,49 +59,70 @@ def main() -> None:
     theta = args.theta
 
     all_budgets = sorted({p["budget"] for r in recs for p in r["probes"]})
+    # Regular interval checkpoints versus each trace's own final checkpoint.
+    # The latter sits at a near-unique budget, so averaging per budget mixes a
+    # handful of traces against the tens of thousands behind a real checkpoint
+    # — and it biases high, since a trace stops when it is already confident.
     cert_by_b: dict[int, list[float]] = defaultdict(list)
+    final_b: list[int] = []
+    final_c: list[float] = []
     for r in recs:
         for p in r["probes"]:
-            if p.get("certainty") is not None:
-                cert_by_b[p["budget"]].append(p["certainty"])
+            cert = p.get(cert_key)
+            if cert is None:
+                continue
+            if p.get("is_final"):
+                final_b.append(p["budget"])
+                final_c.append(cert)
+            else:
+                cert_by_b[p["budget"]].append(cert)
 
-    first_ans: dict[str, tuple[int, bool]] = {}
+    # Cumulative: a trace joins the count at its own final checkpoint — the
+    # budget it actually stopped at. Keying on the first *answered* checkpoint
+    # instead saturates at the first budget probes exist for (every trace is
+    # forced to answer there), so the curves never move.
+    stop: list[tuple[int, bool]] = []
     for r in recs:
-        for p in r["probes"]:
-            if p.get("answer") is not None:
-                first_ans[r["key"]] = (p["budget"], is_correct(r, p["answer"]))
-                break
+        last = next((p for p in reversed(r["probes"]) if p.get("is_final")),
+                    None)
+        if last is None or last.get("answer") is None:
+            continue
+        stop.append((last["budget"], is_correct(r, last["answer"])))
+    stop.sort()
     n_total = len(recs)
     cum_corr, cum_incorr, cum_unans = [], [], []
+    c = i = k = 0
     for b in all_budgets:
-        c = i = 0
-        for fb, ok in first_ans.values():
-            if fb <= b:
-                if ok:
-                    c += 1
-                else:
-                    i += 1
+        while k < len(stop) and stop[k][0] <= b:
+            if stop[k][1]:
+                c += 1
+            else:
+                i += 1
+            k += 1
         cum_corr.append(c)
         cum_incorr.append(i)
         cum_unans.append(n_total - c - i)
 
     # ---------------- Fig: certainty vs step -----------------------------
     means, q1s, q3s = [], [], []
-    bs = [b for b in all_budgets if len(cert_by_b[b]) >= 3]
+    bs = sorted(cert_by_b)  # regular checkpoints only
     for b in bs:
         xs = sorted(cert_by_b[b])
         means.append(sum(xs) / len(xs))
         q1s.append(xs[len(xs) // 4])
         q3s.append(xs[(3 * len(xs)) // 4])
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(bs, means, "o-", color="#2980b9", ms=3, label="mean certainty")
-    ax.fill_between(bs, q1s, q3s, alpha=0.25, color="#2980b9",
+    ax.scatter(final_b, final_c, s=2, color="#95a5a6", alpha=0.15, zorder=1,
+               label="per-trace final checkpoint")
+    ax.plot(bs, means, "o-", color="#2980b9", ms=3, zorder=3,
+            label="mean certainty (regular checkpoints)")
+    ax.fill_between(bs, q1s, q3s, alpha=0.25, color="#2980b9", zorder=2,
                     label="IQR across traces")
     ax.axhline(theta, color="#c0392b", ls="--", lw=1, label=f"θ={theta}")
     ax.set_xlabel("thinking budget (tokens)")
     ax.set_ylabel("probe certainty (Eq. 3)")
     ax.set_title(f"Certainty vs thinking step ({len(recs)} traces)\n"
-                 "(paper Fig 4)")
+                 "grey = per-trace final checkpoint (paper Fig 4)")
     ax.legend()
     style_ax(ax)
     fig.tight_layout()
@@ -112,11 +136,11 @@ def main() -> None:
     ax.plot(bs, [cum_incorr[all_budgets.index(b)] for b in bs], "s-",
             color="#c0392b", ms=3, label="incorrect")
     ax.plot(bs, [cum_unans[all_budgets.index(b)] for b in bs], "^-",
-            color="#bdc3c7", ms=3, label="unanswered")
+            color="#bdc3c7", ms=3, label="still thinking")
     ax.set_xlabel("thinking budget (tokens)")
     ax.set_ylabel(f"traces (n={n_total})")
-    ax.set_title("Cumulative predictions over thinking budget\n"
-                 "(correct / incorrect / unanswered)")
+    ax.set_title("Cumulative traces by their final checkpoint\n"
+                 "(correct / incorrect / still thinking)")
     ax.legend()
     style_ax(ax)
     fig.tight_layout()
@@ -138,8 +162,8 @@ def main() -> None:
             p["answer"] for p in reversed(r["probes"])
             if p.get("answer") is not None))
         hit = next((p for p in r["probes"]
-                    if p.get("certainty") is not None
-                    and p["certainty"] >= theta), None)
+                    if p.get(cert_key) is not None
+                    and p[cert_key] >= theta), None)
         if hit:
             exit_tokens.append(hit["budget"])
             exits_ok.append(is_correct(r, hit["answer"]))
@@ -178,21 +202,28 @@ def main() -> None:
     # ---------------- Fig: Grade vs budget with abstention ---------------
     penalties = (0.0, 0.25, 0.5, 1.0)
     n_problems = len({r["problem_id"] for r in recs})
+    # The penalty enters only through (nc, ni), and a trace's correctness at a
+    # budget is fixed, so tally each trace/budget pair once. Re-scanning and
+    # re-grading inside the penalty loop costs 4 x |bs| x |recs| (about two
+    # hours at 84k traces).
+    tally: dict[int, list[int]] = {}
+    for r in recs:
+        for q in r["probes"]:
+            if q.get("answer") is None:
+                continue
+            t = tally.setdefault(q["budget"], [0, 0, 0])
+            cert = q.get(cert_key)
+            if cert is not None and cert < theta:
+                t[0] += 1  # abstain
+            elif is_correct(r, q["answer"]):
+                t[1] += 1
+            else:
+                t[2] += 1
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for p, color in zip(penalties, ("#bdc3c7", "#f39c12", "#e67e22", "#c0392b")):
         grades = []
         for b in bs:
-            nc = ni = na = 0
-            for r in recs:
-                pr = next((q for q in r["probes"] if q["budget"] == b), None)
-                if pr is None or pr.get("answer") is None:
-                    continue
-                if pr.get("certainty") is not None and pr["certainty"] < theta:
-                    na += 1  # abstain
-                elif is_correct(r, pr["answer"]):
-                    nc += 1
-                else:
-                    ni += 1
+            na, nc, ni = tally.get(b, (0, 0, 0))
             grades.append((nc - p * ni) / n_problems)
         ax.plot(bs, grades, "o-", ms=3, color=color,
                 label=f"p={p} (abstain below θ={theta})")

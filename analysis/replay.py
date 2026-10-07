@@ -16,7 +16,19 @@ from certainty_guided_reasoning.grader import infer_task, probe_answer_equal
 THETAS = [0.90, 0.95, 0.96, 0.97, 0.98, 0.99]
 MAX_SEED = 64
 BINS = 15
-PROBE_PREFIX = "\n\nFinal Answer: \\boxed{"  # mirrors probe_sweep.PROBE_PREFIX
+PROBE_PREFIX = "\n\nFinal Answer: \\boxed{"  # legacy: Qwen3.5 (no </think>)
+
+
+def probe_prefix_for(model: str) -> str:
+    """Probe prefix for a model family.
+
+    Mirrors `certainty_guided_reasoning.probe_sweep.probe_prefix_for`. Kept
+    here by hand because importing probe_sweep pulls in the HTTP client.
+    """
+    m = (model or "").lower()
+    if "deepseek-r1" in m or "qwq" in m:
+        return "</think>\n\nFinal answer: \\boxed{"
+    return PROBE_PREFIX
 
 
 def count_chars(text: str) -> int:
@@ -24,10 +36,10 @@ def count_chars(text: str) -> int:
     return len(text)
 
 
-def make_counter(spec: str | None):
+def make_counter(spec: str | None, prefix: str = PROBE_PREFIX):
     """Return (count_tokens, prefix_tokens, label) for probe-cost accounting."""
     if not spec:
-        n = count_chars(PROBE_PREFIX)
+        n = count_chars(prefix)
         return count_chars, n, "chars (upper bound on tokens)"
     from tokenizers import Tokenizer  # exact mode only
 
@@ -39,7 +51,7 @@ def make_counter(spec: str | None):
     def count(text: str) -> int:
         return len(tok.encode(text).ids)
 
-    return count, count(PROBE_PREFIX), f"tokenizer {path.name}"
+    return count, count(prefix), f"tokenizer {path.name}"
 
 
 def answer_cost(answer, count_tokens, prefix_tokens: int) -> int:
@@ -72,11 +84,14 @@ def answered(rec: dict) -> list[dict]:
 
 
 def simulate(recs: list[dict], theta: float, count_tokens=count_chars,
-             prefix_tokens: int | None = None) -> dict:
+             prefix_tokens: int | None = None,
+             cert_key: str = "certainty") -> dict:
     """Post-hoc CGR replay, with and without probe cost.
 
     `saved_pct` counts thinking tokens only; `saved_pct_net` adds the cost of
     every probe that ran (prefix plus decoded answer) and one final decode.
+    `cert_key` selects the certainty variant: "certainty" (min token-prob,
+    paper Eq. 3) or "certainty_mean" (mean token-prob).
     """
     prefix_cost = count_chars(PROBE_PREFIX) if prefix_tokens is None else prefix_tokens
     n = acc_base = acc_cgr = 0
@@ -91,7 +106,8 @@ def simulate(recs: list[dict], theta: float, count_tokens=count_chars,
         n += 1
         acc_base += base_ok
         tok_full += last["budget"]
-        hit = next((p for p in ans if p["certainty"] >= theta), None)
+        hit = next((p for p in ans if p.get(cert_key) is not None
+                    and p[cert_key] >= theta), None)
         exit_budget = hit["budget"] if hit else last["budget"]
         exit_answer = hit["answer"] if hit else last["answer"]
         tok_exit += exit_budget

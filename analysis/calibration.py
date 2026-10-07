@@ -39,21 +39,21 @@ def reliability_data(conf: np.ndarray, correct: np.ndarray,
             np.array(counts), bins)
 
 
-def collect(recs: list[dict], mode: str):
+def collect(recs: list[dict], mode: str, cert_key: str = "certainty"):
     """Return (conf, correct) arrays for the requested aggregation mode."""
     confs, corrects = [], []
     for r in recs:
         ans = [p for p in r["probes"] if p.get("answer") is not None
-               and p.get("certainty") is not None]
+               and p.get(cert_key) is not None]
         if not ans:
             continue
         if mode == "pooled":
             for p in ans:
-                confs.append(p["certainty"])
+                confs.append(p[cert_key])
                 corrects.append(is_correct(r, p["answer"]))
         else:  # final
             last = ans[-1]
-            confs.append(last["certainty"])
+            confs.append(last[cert_key])
             corrects.append(is_correct(r, last["answer"]))
     return np.array(confs, dtype=float), np.array(corrects, dtype=bool)
 
@@ -92,6 +92,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("probe_dir", nargs="?", default=str(PROBES_DIR))
     ap.add_argument("--out", default=None, help="figs dir")
+    ap.add_argument("--metric", choices=("min", "mean"), default="min",
+                    help="certainty variant: min (Eq. 3) or mean token-prob")
     ap.add_argument("--bins", type=int, default=15)
     ap.add_argument("--dpi", type=int, default=150,
                     help="raster resolution; ignored for pdf and svg")
@@ -103,7 +105,8 @@ def main() -> None:
 
     global N_BINS
     N_BINS = args.bins
-    metric_label = "min token-prob"
+    cert_key = "certainty" if args.metric == "min" else "certainty_mean"
+    metric_label = "min token-prob" if args.metric == "min" else "mean token-prob"
 
     root = Path(args.probe_dir)
     default_figs = ("figs_sampled" if root.name == "probes_sampled"
@@ -134,7 +137,7 @@ def main() -> None:
     report.append("")
 
     for mode in ("final", "pooled"):
-        conf, correct = collect(recs, mode)
+        conf, correct = collect(recs, mode, cert_key)
         if len(conf) == 0:
             print(f"[{mode}] no samples")
             continue
